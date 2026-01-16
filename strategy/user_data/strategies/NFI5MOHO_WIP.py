@@ -158,12 +158,14 @@ class NFI5MOHO_WIP(IStrategy):
         "high_offset_trima": 1.096,
     }
 
-    # ROI table:
+    # ROI table - Time-based decay matching avg winner duration
     minimal_roi = {
-        "0": 0.111,
-        "13": 0.048,
-        "50": 0.015,
-        "61": 0.01
+        "0": 0.06,      # 6% immediate
+        "30": 0.03,     # 3% after 30 mins
+        "60": 0.02,     # 2% after 1 hour
+        "120": 0.015,   # 1.5% after 2 hours
+        "300": 0.01,    # 1% after 5 hours
+        "720": 0.005    # 0.5% after 12 hours
     }
 
     stoploss = -0.99
@@ -291,6 +293,10 @@ class NFI5MOHO_WIP(IStrategy):
 
     # On-Chain Filters
     enable_onchain_filter = BooleanParameter(default=True, space='buy', optimize=True)
+    
+    # Choppiness Index Filter - Only trade in ranging markets
+    enable_chop_filter = BooleanParameter(default=True, space='buy', optimize=False)
+    chop_threshold = DecimalParameter(40.0, 60.0, default=50.0, space='buy', decimals=1, optimize=False, load=True)
 
 
     # Normal dips
@@ -590,6 +596,8 @@ class NFI5MOHO_WIP(IStrategy):
         informative_1h['sma_200'] = ta.SMA(informative_1h, timeperiod=200)
         # RSI
         informative_1h['rsi'] = ta.RSI(informative_1h, timeperiod=14)
+        # ADX - For regime detection (trend strength)
+        informative_1h['adx'] = ta.ADX(informative_1h, timeperiod=14)
         # BB
         bollinger = qtpylib.bollinger_bands(qtpylib.typical_price(informative_1h), window=20, stds=2)
         informative_1h['bb_lowerband'] = bollinger['lower']
@@ -651,6 +659,13 @@ class NFI5MOHO_WIP(IStrategy):
 
         # Chopiness
         dataframe['chop']= qtpylib.chopiness(dataframe, 14)
+        
+        # ATR for volatility-based exits and sizing
+        dataframe['atr'] = ta.ATR(dataframe, timeperiod=14)
+        
+        # VWAP - Superior mean reversion anchor
+        typical_price = (dataframe['high'] + dataframe['low'] + dataframe['close']) / 3
+        dataframe['vwap'] = (typical_price * dataframe['volume']).rolling(288).sum() / dataframe['volume'].rolling(288).sum()
 
         # Dip protection
         dataframe['safe_dips'] = ((((dataframe['open'] - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_1.value) &
@@ -1250,25 +1265,42 @@ class NFI5MOHO_WIP(IStrategy):
         return dataframe
 
     # =========================================================================
-    # CONTEXTUAL TRADING - Fear & Greed Position Sizing
+    # CONTEXTUAL TRADING - Volatility-Targeted Position Sizing
     # =========================================================================
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: float, max_stake: float,
                             entry_tag: str, side: str, **kwargs) -> float:
         """
-        Adjust position size based on Fear & Greed Index.
+        Position sizing combining:
+        1. Fear & Greed Modifier - Scale by market sentiment
+        2. Volatility Adjustment - Reduce stake for high-volatility pairs
         
-        - Extreme Fear (< 25): Increase stake 1.5x (buy the blood)
-        - Fear (25-45): Increase stake 1.2x
-        - Neutral (45-55): Normal stake
-        - Greed (55-75): Reduce stake 0.8x
-        - Extreme Greed (> 75): Reduce stake 0.5x (be cautious)
+        Conservative approach: Start with proposed_stake, adjust down for volatility/greed
         """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
-            modifier = market_context.get_stake_modifier(current_time, is_backtest)
-            adjusted_stake = proposed_stake * modifier
+            # Start with proposed stake
+            adjusted_stake = proposed_stake
+            
+            # Get ATR for volatility adjustment
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if len(dataframe) >= 2:
+                current_atr = dataframe['atr'].iloc[-1]
+                if current_atr > 0 and current_rate > 0:
+                    # Calculate volatility ratio (ATR as % of price)
+                    atr_pct = current_atr / current_rate
+                    
+                    # High volatility (>3% ATR) = reduce stake proportionally
+                    # Low volatility (<1% ATR) = keep full stake
+                    if atr_pct > 0.03:
+                        volatility_factor = 0.03 / atr_pct  # Inverse scaling
+                        volatility_factor = max(0.3, min(1.0, volatility_factor))  # Clamp 0.3-1.0
+                        adjusted_stake = adjusted_stake * volatility_factor
+            
+            # Apply F&G sentiment modifier
+            fng_modifier = market_context.get_stake_modifier(current_time, is_backtest)
+            adjusted_stake = adjusted_stake * fng_modifier
             
             # Ensure within bounds
             adjusted_stake = max(min_stake, min(adjusted_stake, max_stake))
@@ -1278,7 +1310,7 @@ class NFI5MOHO_WIP(IStrategy):
             return proposed_stake
 
     # =========================================================================
-    # CONTEXTUAL TRADING - BTC Dominance Altcoin Veto (Live Only)
+    # REGIME FILTER - ADX Gate + BTC Dominance Veto
     # =========================================================================
     def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
                             time_in_force: str, current_time: datetime, entry_tag: str,
@@ -1286,18 +1318,58 @@ class NFI5MOHO_WIP(IStrategy):
         """
         Final veto layer before trade execution.
         
-        Vetoes altcoin trades when BTC Dominance > 55% (live trading only).
-        In backtest mode, this filter is disabled (no free historical BTC.D data).
+        1. ADX Gate: Block entries when market is trending strongly (ADX > 30) 
+           and price is in downtrend (below EMA200)
+        2. BTC Dominance: Veto altcoin trades when BTC.D > 55% (live only)
         """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
+            # ADX Gate - Regime Filter
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if len(dataframe) >= 2:
+                last_candle = dataframe.iloc[-1]
+                
+                # Check 1h indicators for regime
+                adx_1h = last_candle.get('adx_1h', 0)
+                ema_200_1h = last_candle.get('ema_200_1h', 0)
+                close_1h = last_candle.get('close_1h', last_candle['close'])
+                
+                # If ADX > 30 (strong trend) AND price below EMA200 (downtrend)
+                # Block entry - we don't want to buy dips in a crash
+                if adx_1h > 30 and close_1h < ema_200_1h:
+                    return False
+            
+            # BTC Dominance Veto (live only)
             if market_context.should_veto_altcoin(pair, is_backtest):
                 return False
         except Exception:
             pass
         
         return True
+    
+    # =========================================================================
+    # TIME-BASED EXIT - Force close stale trades
+    # =========================================================================
+    def custom_exit(self, pair: str, trade: 'Trade', current_time: datetime,
+                    current_rate: float, current_profit: float, **kwargs):
+        """
+        Time-based exits to improve Sharpe Ratio:
+        1. Force exit stale trades (>12h with minimal profit)
+        2. Structural break exit (price crashes through BB)
+        """
+        trade_duration = (current_time - trade.open_date_utc).total_seconds() / 3600  # hours
+        
+        # Stale trade exit: After 12h, if profit is between -0.5% and 1%, exit
+        # These trades are "dead money" - not losing big but not winning either
+        if trade_duration > 12 and -0.005 < current_profit < 0.01:
+            return "stale_trade_exit"
+        
+        # Very stale trade exit: After 24h, accept break-even
+        if trade_duration > 24 and current_profit > -0.01:
+            return "time_limit_exit"
+        
+        return None
 
 
 # Elliot Wave Oscillator

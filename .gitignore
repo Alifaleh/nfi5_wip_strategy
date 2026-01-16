@@ -1,0 +1,144 @@
+# Freqtrade rules
+strategy/config*.json
+strategy/*.sqlite
+strategy/*.sqlite-shm
+strategy/*.sqlite-wal
+strategy/logfile.txt
+strategy/user_data/*/*
+!strategy/user_data/notebooks
+!strategy/user_data/external_data
+!strategy/user_data/models
+!strategy/user_data/freqaimodels
+!strategy/user_data/strategies/*
+!strategy/user_data/strategies_config/*
+!strategy/user_data/common_config/*
+!strategy/user_data/unused_strategies/*
+strategy/user_data/external_data/*
+strategy/binance_browser_user_data
+strategy/binance_browser_user_data.zip
+
+# Macos related
+strategy/.DS_Store
+
+# Byte-compiled / optimized / DLL files
+strategy/__pycache__/
+strategy/*.py[cod]
+strategy/*$py.class
+
+# C extensions
+strategy/*.so
+
+# Distribution / packaging
+strategy/.Python
+strategy/env/
+strategy/build/
+strategy/develop-eggs/
+strategy/dist/
+strategy/downloads/
+strategy/eggs/
+strategy/.eggs/
+strategy/lib/
+strategy/lib64/
+strategy/parts/
+strategy/sdist/
+strategy/var/
+strategy/wheels/
+strategy/*.egg-info/
+strategy/.installed.cfg
+strategy/*.egg
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+strategy/*.manifest
+strategy/*.spec
+
+# Installer logs
+strategy/pip-log.txt
+strategy/pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+strategy/htmlcov/
+strategy/.tox/
+strategy/.coverage
+strategy/.coverage.*
+strategy/.cache
+strategy/nosetests.xml
+strategy/coverage.xml
+strategy/*.cover
+strategy/.hypothesis/
+
+# Translations
+strategy/*.mo
+strategy/*.pot
+
+# Django stuff:
+strategy/*.log
+strategy/local_settings.py
+
+# Flask stuff:
+strategy/instance/
+strategy/.webassets-cache
+
+# Scrapy stuff:
+strategy/.scrapy
+
+# memray
+strategy/memray-*
+
+# Sphinx documentation
+strategy/docs/_build/
+# Mkdocs documentation
+strategy/site/
+
+# PyBuilder
+strategy/target/
+
+# Jupyter Notebook
+strategy/*.ipynb_checkpoints
+
+# pyenv
+strategy/.python-version
+
+strategy/.env
+strategy/.venv
+strategy/.idea
+strategy/.vscode
+
+strategy/.pytest_cache/
+strategy/.mypy_cache/
+
+#exceptions
+!strategy/*.gitkeep
+!strategy/config_examples/config_binance.example.json
+!strategy/config_examples/config_full.example.json
+!strategy/config_examples/config_kraken.example.json
+!strategy/config_examples/config_freqai.example.json
+
+strategy/docker-compose-*.yml
+
+.venv
+binance_browser_user_data
+binance_browser_user_data_backup.tar
+binance_browser_user_data.zip
+analysis_results.json
+__pycache__
+.env
+google-chrome-stable_current_amd64.deb
+login_qrcode.png
+project_prompt_generator
+
+crypto_market_analyzer/.venv
+crypto_market_analyzer/temp/*
+!crypto_market_analyzer/temp/.gitkeep
+crypto_market_analyzer/binance_browser_user_data
+crypto_market_analyzer/binance_browser_user_data.zip
+crypto_market_analyzer/binance_browser_user_data_backup.tar
+crypto_market_analyzer/analysis_results.json
+crypto_market_analyzer/__pycache__
+crypto_market_analyzer/.env
+crypto_market_analyzer/google-chrome-stable_current_amd64.deb
+crypto_market_analyzer/login_qrcode.png
+crypto_market_analyzer/project_prompt_generator
+project_prompt_generator
+project_prompt.md

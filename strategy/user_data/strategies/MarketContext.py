@@ -253,7 +253,7 @@ class MarketContext:
         """
         Check if altcoin trade should be vetoed due to high BTC dominance.
         
-        When BTC.D > 55%, capital is flowing into BTC as a safe haven.
+        When BTC.D > 60%, capital is flowing into BTC as a safe haven.
         Altcoins typically bleed during these periods.
         
         Note: Only active in live trading (historical BTC.D not available).
@@ -275,9 +275,9 @@ class MarketContext:
         
         btc_dom = self.get_btc_dominance(is_backtest=False)
         
-        # Veto altcoins when BTC dominance > 55%
-        if btc_dom > 55.0:
-            logger.info(f"VETO {pair}: BTC Dominance at {btc_dom:.1f}% (>55%)")
+        # Veto altcoins when BTC dominance > 60%
+        if btc_dom > 60.0:
+            logger.info(f"VETO {pair}: BTC Dominance at {btc_dom:.1f}% (>60%)")
             return True
         
         return False

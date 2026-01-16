@@ -1320,7 +1320,7 @@ class NFI5MOHO_WIP(IStrategy):
         
         1. ADX Gate: Block entries when market is trending strongly (ADX > 30) 
            and price is in downtrend (below EMA200)
-        2. BTC Dominance: Veto altcoin trades when BTC.D > 55% (live only)
+        2. BTC Dominance: Veto altcoin trades when BTC.D > 60% (live only)
         """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
@@ -1346,7 +1346,7 @@ class NFI5MOHO_WIP(IStrategy):
             # BTC Dominance Veto (live only)
             if market_context.should_veto_altcoin(pair, is_backtest):
                 if not is_backtest:
-                    msg = f"⛔ {pair} Entry Rejected by BTC Dominance Veto\nBTC.D > 55%"
+                    msg = f"⛔ {pair} Entry Rejected by BTC Dominance Veto\nBTC.D > 60%"
                     self.dp.send_msg(msg)
                 return False
         except Exception:

@@ -14,4 +14,4 @@ services:
     env_file:
       - .env
     command: >
-      trade --config /freqtrade/user_data/strategies_config/config.json --strategy NFI5MOHO_WIP
+      trade --config /freqtrade/user_data/strategies_config/config_live.json --strategy NFI5MOHO_WIP

@@ -1,0 +1,17 @@
+---
+services:
+
+  freqtrade_nfi5:
+    build:
+      context: .
+      dockerfile: strategy/docker_files/Dockerfile
+    restart: unless-stopped
+    container_name: freqtrade_nfi5
+    volumes:
+      - "./strategy/user_data:/freqtrade/user_data"
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    command: >
+      trade --config /freqtrade/user_data/strategies_config/config.json --strategy NFI5MOHO_WIP

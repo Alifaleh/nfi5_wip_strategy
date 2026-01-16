@@ -5,6 +5,8 @@ from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy import (merge_informative_pair,
                                 DecimalParameter, IntParameter, CategoricalParameter, BooleanParameter)
 from pandas import DataFrame
+import pandas as pd
+pd.set_option('future.no_silent_downcasting', True)
 from functools import reduce
 from freqtrade.persistence import Trade
 from datetime import datetime
@@ -26,7 +28,14 @@ except ImportError:
     except ImportError:
         from strategies.OnChainOracle import OnChainOracle
 
-
+# Market Context Import (Fear & Greed, BTC Dominance)
+try:
+    from user_data.strategies.MarketContext import market_context
+except ImportError:
+    try:
+        from strategies.MarketContext import market_context
+    except ImportError:
+        from MarketContext import market_context
 
 ###########################################################################################################
 ##                NostalgiaForInfinityV5 by iterativ                                                     ##
@@ -132,10 +141,10 @@ class NFI5MOHO_WIP(IStrategy):
         # Enable/Disable conditions
         "sell_condition_1_enable": True,
         "sell_condition_2_enable": True,
-        "sell_condition_3_enable": True,
+        "sell_condition_3_enable": False,  # Disabled: too simple, triggers early
         "sell_condition_4_enable": True,
         "sell_condition_5_enable": True,
-        "sell_condition_6_enable": True,
+        "sell_condition_6_enable": False,  # Disabled: holds too long on downtrends
         "sell_condition_7_enable": True,
         "sell_condition_8_enable": True,
         #############
@@ -1239,6 +1248,56 @@ class NFI5MOHO_WIP(IStrategy):
             ] = 1
 
         return dataframe
+
+    # =========================================================================
+    # CONTEXTUAL TRADING - Fear & Greed Position Sizing
+    # =========================================================================
+    def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
+                            proposed_stake: float, min_stake: float, max_stake: float,
+                            entry_tag: str, side: str, **kwargs) -> float:
+        """
+        Adjust position size based on Fear & Greed Index.
+        
+        - Extreme Fear (< 25): Increase stake 1.5x (buy the blood)
+        - Fear (25-45): Increase stake 1.2x
+        - Neutral (45-55): Normal stake
+        - Greed (55-75): Reduce stake 0.8x
+        - Extreme Greed (> 75): Reduce stake 0.5x (be cautious)
+        """
+        is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
+        
+        try:
+            modifier = market_context.get_stake_modifier(current_time, is_backtest)
+            adjusted_stake = proposed_stake * modifier
+            
+            # Ensure within bounds
+            adjusted_stake = max(min_stake, min(adjusted_stake, max_stake))
+            
+            return adjusted_stake
+        except Exception:
+            return proposed_stake
+
+    # =========================================================================
+    # CONTEXTUAL TRADING - BTC Dominance Altcoin Veto (Live Only)
+    # =========================================================================
+    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float,
+                            time_in_force: str, current_time: datetime, entry_tag: str,
+                            side: str, **kwargs) -> bool:
+        """
+        Final veto layer before trade execution.
+        
+        Vetoes altcoin trades when BTC Dominance > 55% (live trading only).
+        In backtest mode, this filter is disabled (no free historical BTC.D data).
+        """
+        is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
+        
+        try:
+            if market_context.should_veto_altcoin(pair, is_backtest):
+                return False
+        except Exception:
+            pass
+        
+        return True
 
 
 # Elliot Wave Oscillator

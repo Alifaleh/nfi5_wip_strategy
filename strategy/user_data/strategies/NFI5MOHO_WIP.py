@@ -1338,10 +1338,16 @@ class NFI5MOHO_WIP(IStrategy):
                 # If ADX > 30 (strong trend) AND price below EMA200 (downtrend)
                 # Block entry - we don't want to buy dips in a crash
                 if adx_1h > 30 and close_1h < ema_200_1h:
+                    if not is_backtest:
+                        msg = f"⛔ {pair} Entry Rejected by ADX Gate\nADX: {adx_1h:.1f} (>30)\nTrend: Bearish (Price < EMA200)"
+                        self.dp.send_msg(msg)
                     return False
             
             # BTC Dominance Veto (live only)
             if market_context.should_veto_altcoin(pair, is_backtest):
+                if not is_backtest:
+                    msg = f"⛔ {pair} Entry Rejected by BTC Dominance Veto\nBTC.D > 55%"
+                    self.dp.send_msg(msg)
                 return False
         except Exception:
             pass

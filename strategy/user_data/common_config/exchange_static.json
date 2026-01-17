@@ -46,7 +46,10 @@
             "SOL/USDT"
         ],
         "pair_blacklist": [
-            "BNB/.*"
+            "BNB/.*",
+            "TRX/USDT",
+            "ENA/USDT",
+            "POL/USDT"
         ]
     },
     "pairlists": [

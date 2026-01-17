@@ -11,6 +11,32 @@ from functools import reduce
 from freqtrade.persistence import Trade
 from datetime import datetime
 from freqtrade.enums import RunMode
+import requests
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+# --- Simple TTL Cache (Dependency Free) ---
+class SimpleTTLCache:
+    def __init__(self, ttl: int = 43200): # 12 hours default
+        self.cache = {}
+        self.ttl = ttl
+
+    def get(self, key):
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if time.time() - timestamp < self.ttl:
+                return value
+            else:
+                del self.cache[key]
+        return None
+
+    def set(self, key, value):
+        self.cache[key] = (value, time.time())
+
+# Global Cache Instance
+cg_cache = SimpleTTLCache(ttl=43200)
 
 # On-Chain Oracle Import
 import sys
@@ -248,6 +274,34 @@ class NFI5MOHO_WIP(IStrategy):
                         current_profit: float, **kwargs) -> float:
         
         return self.stoploss
+
+    def get_coingecko_rank(self, symbol: str) -> int:
+        """
+        Fetches Market Cap Rank from CoinGecko.
+        Cached for 12 hours. Returns 999 if API fails or coin not found.
+        """
+        cached_rank = cg_cache.get(symbol)
+        if cached_rank is not None:
+             return cached_rank
+
+        try:
+            # Map symbol to ID (Basic heuristic: remove /USDT and lowercase)
+            base_currency = symbol.split('/')[0].lower()
+            
+            # Note: For production, query /coins/list to map symbol -> id
+            url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={base_currency}"
+            
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    rank = data[0].get('market_cap_rank', 999)
+                    if rank is None: rank = 999 # Handle nulls
+                    cg_cache.set(symbol, rank)
+                    return rank
+            return 999
+        except Exception:
+            return 999
 
     #############################################################
 
@@ -735,11 +789,21 @@ class NFI5MOHO_WIP(IStrategy):
 
         return None
 
+    # Safe Pump (Green Candle) settings
+    buy_min_inc_1 = DecimalParameter(0.01, 0.05, default=0.022, space='buy', decimals=3, optimize=False, load=True)
+
     def informative_pairs(self):
         # get access to all pairs available in whitelist.
         pairs = self.dp.current_whitelist()
         # Assign tf to each pair so they can be downloaded and cached for strategy.
         informative_pairs = [(pair, '1h') for pair in pairs]
+        
+        # --- SMART PAIR FILTER REQUIREMENTS ---
+        # 1. Macro Trend Check (1d)
+        informative_pairs += [(pair, '1d') for pair in pairs]
+        # 2. Relative Strength (Alpha) Check (BTC/USDT)
+        informative_pairs += [("BTC/USDT", "5m"), ("BTC/USDT", "1d")]
+        
         return informative_pairs
 
     def informative_1h_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -879,6 +943,55 @@ class NFI5MOHO_WIP(IStrategy):
         return dataframe
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        
+        # --- SMART PAIR FILTER INDICATORS ---
+        if self.dp:
+             # A. Macro Trend Indicators (1d context)
+            inf_tf = '1d'
+            informative_1d = self.dp.get_pair_dataframe(pair=metadata['pair'], timeframe=inf_tf)
+            
+            # Indicators for Waterfall Check
+            informative_1d['ema_200'] = ta.EMA(informative_1d, timeperiod=200)
+            informative_1d['adx'] = ta.ADX(informative_1d)
+            informative_1d['di_plus'] = ta.PLUS_DI(informative_1d)
+            informative_1d['di_minus'] = ta.MINUS_DI(informative_1d)
+
+            dataframe = merge_informative_pair(dataframe, informative_1d, self.timeframe, '1d', ffill=True)
+
+            # B. Relative Strength (Alpha) Calculation
+            # Calculate percent change over last 24h (288 candles at 5m)
+            dataframe['pct_change_24h'] = dataframe['close'].pct_change(periods=288)
+            
+            # Fetch BTC Data for Comparison
+            btc_df_5m = self.dp.get_pair_dataframe(pair="BTC/USDT", timeframe=self.timeframe)
+            if not btc_df_5m.empty and len(btc_df_5m) > 0:
+                btc_df_5m['btc_pct_change_24h'] = btc_df_5m['close'].pct_change(periods=288)
+                # Direct assignment via date merge
+                btc_subset = btc_df_5m[['date', 'btc_pct_change_24h']].copy()
+                dataframe = dataframe.merge(btc_subset, on='date', how='left')
+
+            # Calculate Alpha: Asset Performance minus Market Performance
+            if 'btc_pct_change_24h' in dataframe.columns:
+                dataframe['alpha_24h'] = dataframe['pct_change_24h'] - dataframe['btc_pct_change_24h']
+            else:
+                 dataframe['alpha_24h'] = 0.0 # Default neutral
+
+            # C. Backtest vs Live Liquidity
+            # In Backtest, we simulate 24h quote volume
+            dataframe['quote_volume_24h_rolling'] = (dataframe['close'] * dataframe['volume']).rolling(window=288).sum()
+
+            # D. PREDICTIVE FILTERS (Catches BEFORE the crash)
+            
+            # 1. Distance from 30-day High (8640 candles at 5m = 30 days)
+            # If price is within 10% of its 30-day high, it's at risk of reversal
+            dataframe['high_30d'] = dataframe['high'].rolling(window=8640).max()
+            dataframe['distance_from_high'] = (dataframe['high_30d'] - dataframe['close']) / dataframe['high_30d']
+            
+            # 2. 7-day Pump Detection (2016 candles at 5m = 7 days)
+            # If price pumped >15% in last 7 days, avoid buying the top
+            dataframe['pct_change_7d'] = dataframe['close'].pct_change(periods=2016)
+
+
         # The indicators for the 1h informative timeframe
         informative_1h = self.informative_1h_indicators(dataframe, metadata)
         
@@ -1503,42 +1616,41 @@ class NFI5MOHO_WIP(IStrategy):
                             side: str, **kwargs) -> bool:
         """
         Final veto layer before trade execution.
-        
-        1. ADX Gate: Block entries when market is trending strongly (ADX > 30) 
-           and price is in downtrend (below EMA200)
-        2. BTC Dominance: Veto altcoin trades when BTC.D > 60% (live only)
+        Includes: Smart Pair Filters + ADX Gate + BTC Dominance Veto
         """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
             # Get Analyzed Dataframe
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if len(dataframe) < 1:
+                return False
             last_candle = dataframe.iloc[-1]
 
-            if self.enable_onchain_filter.value:
-                # Check for high risk signals
-                try:
-                    # We need to access the dataframe row here as well, safely. 
-                    # But confirm_trade_entry assumes 'last_candle' is the current state.
-                    # Since we removed the price action check, this is now just for metadata/network health.
-                    pass
-                except Exception:
-                    pass
-            # Detects strong bearish trends using DMI
-            # If ADX > 25 (Trend) AND DI- > DI+ (Bearish) -> Veto
-            # if last_candle['adx'] > 25.0 and last_candle['minus_di'] > last_candle['plus_di']:
-            #     # Ensure we are not catching a knife in a strong trend
-            #     if not is_backtest:
-            #         msg = f"⛔ {pair} Entry Rejected by ADX Trend Veto\nADX: {last_candle['adx']:.1f} (>25)\nDirection: Bearish (DI- > DI+)"
-            #         self.dp.send_msg(msg)
-            #     return False
+            # ============== MINIMAL FILTER: Only block extreme "buy the top" ==============
+            
+            # NOTE: Pair blacklist should be in config, not hardcoded here
+            # See exchange.pair_blacklist in config_backtest.json
+            
+            # DISABLED: Macro Trend, Liquidity, Alpha, Distance from High
+            # (These blocked too many profitable trades)
+            
+            # ONLY FILTER: 7-day Pump (set to 50% - optimal threshold)
+            # This catches the specific "bought PROM/DASH at peak then crashed" scenario
+            if 'pct_change_7d' in last_candle:
+                pct7d = last_candle['pct_change_7d']
+                if pd.notna(pct7d) and pct7d > 0.50:  # Pumped more than 50% in 7 days
+                    return False
 
+            # ============== ORIGINAL FILTERS ==============
+            
             # BTC Dominance Veto (live only)
             if market_context.should_veto_altcoin(pair, is_backtest):
                 if not is_backtest:
                     msg = f"⛔ {pair} Entry Rejected by BTC Dominance Veto\nBTC.D > 60%"
                     self.dp.send_msg(msg)
                 return False
+                
         except Exception:
             pass
         
@@ -1550,20 +1662,18 @@ class NFI5MOHO_WIP(IStrategy):
     def custom_exit(self, pair: str, trade: 'Trade', current_time: datetime,
                     current_rate: float, current_profit: float, **kwargs):
         """
-        Time-based exits to improve Sharpe Ratio:
-        1. Force exit stale trades (>12h with minimal profit)
-        2. Structural break exit (price crashes through BB)
+        Time-based exits - DISABLED (all were losses in backtesting)
         """
-        trade_duration = (current_time - trade.open_date_utc).total_seconds() / 3600  # hours
+        # DISABLED: These exits only produced losses in backtesting
+        # trade_duration = (current_time - trade.open_date_utc).total_seconds() / 3600
         
-        # Stale trade exit: After 12h, if profit is between -0.5% and 1%, exit
-        # These trades are "dead money" - not losing big but not winning either
-        if trade_duration > 12 and -0.005 < current_profit < 0.01:
-            return "stale_trade_exit"
+        # stale_trade_exit: -$38 (11 losses, 0 wins) - DISABLED
+        # if trade_duration > 12 and -0.005 < current_profit < 0.01:
+        #     return "stale_trade_exit"
         
-        # Very stale trade exit: After 24h, accept break-even
-        if trade_duration > 24 and current_profit > -0.01:
-            return "time_limit_exit"
+        # time_limit_exit: -$27 (3 losses, 0 wins) - DISABLED
+        # if trade_duration > 24 and current_profit > -0.01:
+        #     return "time_limit_exit"
         
         return None
 

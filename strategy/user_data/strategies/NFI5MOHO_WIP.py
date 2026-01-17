@@ -13,7 +13,6 @@ from datetime import datetime
 from freqtrade.enums import RunMode
 
 # On-Chain Oracle Import
-# On-Chain Oracle Import
 import sys
 from pathlib import Path
 try:
@@ -36,6 +35,46 @@ except ImportError:
         from strategies.MarketContext import market_context
     except ImportError:
         from MarketContext import market_context
+
+# ---------------------------------------------------------------------------------------------------------
+    # Helper Functions for Dynamic ROI
+# ---------------------------------------------------------------------------------------------------------
+
+def RMI(dataframe, *, length=20, mom=5):
+    """
+    Source: https://github.com/freqtrade/technical/blob/master/technical/indicators/indicators.py#L912
+    """
+    df = dataframe.copy()
+
+    df['maxup'] = (df['close'] - df['close'].shift(mom)).clip(lower=0)
+    df['maxdown'] = (df['close'].shift(mom) - df['close']).clip(lower=0)
+
+    df['maxup'] = df['maxup'].fillna(0)
+    df['maxdown'] = df['maxdown'].fillna(0)
+
+    df["emaInc"] = ta.EMA(df, price='maxup', timeperiod=length)
+    df["emaDec"] = ta.EMA(df, price='maxdown', timeperiod=length)
+
+    df['RMI'] = np.where(df['emaDec'] == 0, 0, 100 - 100 / (1 + df["emaInc"] / df["emaDec"]))
+
+    return df["RMI"]
+
+def SSLChannels_ATR(dataframe, length=7):
+    """
+    SSL Channels with ATR: https://www.tradingview.com/script/SKHqWzql-SSL-ATR-channel/
+    Credit to @JimmyNixx for python
+    """
+    df = dataframe.copy()
+
+    df['ATR'] = ta.ATR(df, timeperiod=14)
+    df['smaHigh'] = df['high'].rolling(length).mean() + df['ATR']
+    df['smaLow'] = df['low'].rolling(length).mean() - df['ATR']
+    df['hlv'] = np.where(df['close'] > df['smaHigh'], 1, np.where(df['close'] < df['smaLow'], -1, np.nan))
+    df['hlv'] = df['hlv'].ffill()
+    df['sslDown'] = np.where(df['hlv'] < 0, df['smaHigh'], df['smaLow'])
+    df['sslUp'] = np.where(df['hlv'] < 0, df['smaLow'], df['smaHigh'])
+
+    return df['sslDown'], df['sslUp']
 
 ###########################################################################################################
 ##                NostalgiaForInfinityV5 by iterativ                                                     ##
@@ -81,8 +120,81 @@ class NFI5MOHO_WIP(IStrategy):
         'sell': 'limit',
         'trailing_stop_loss': 'limit',
         'stoploss': 'limit',
+        'stoploss': 'limit',
+        'stoploss': 'limit',
         'stoploss_on_exchange': False
     }
+
+    def get_table_roi(self, trade_dur: int) -> float:
+        """
+        Returns the ROI value from the minimal_roi table for the given duration.
+        """
+        # Sort keys descending to find the matching time bracket
+        roi_list = sorted([(int(k), v) for k, v in self.minimal_roi.items()], key=lambda x: x[0], reverse=True)
+        for t, roi in roi_list:
+            if trade_dur >= t:
+                return roi
+        return 1.0 # Default high ROI if not found (shouldn't happen with "0")
+
+    def min_roi_reached_dynamic(self, trade: Trade, current_profit: float, current_time: datetime, trade_dur: int) -> tuple[int | None, float | None]:
+        table_roi = self.get_table_roi(trade_dur)
+
+        # Get current candle from analyzing dataframe
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair=trade.pair, timeframe=self.timeframe)
+        if len(dataframe) == 0:
+            return trade_dur, table_roi
+        
+        # Use last closed candle
+        last_candle = dataframe.iloc[-1].squeeze()
+
+        rmi_trend = last_candle['rmi-up-trend']
+        candle_trend = last_candle['candle-up-trend']
+        ssl_dir = last_candle['ssl-dir']
+
+        min_roi = table_roi
+        max_profit = trade.calc_profit_ratio(trade.max_rate)
+        pullback_value = (max_profit - self.droi_pullback_amount.value)
+        in_trend = False
+
+        if self.droi_trend_type.value == 'rmi' or self.droi_trend_type.value == 'any':
+            if rmi_trend == 1:
+                in_trend = True
+        if self.droi_trend_type.value == 'ssl' or self.droi_trend_type.value == 'any':
+            if ssl_dir == 'up':
+                in_trend = True
+        if self.droi_trend_type.value == 'candle' or self.droi_trend_type.value == 'any':
+            if candle_trend == 1:
+                in_trend = True
+
+        # Force the ROI value high if in trend
+        if (in_trend == True):
+            min_roi = 100
+            # If pullback is enabled, allow to sell if a pullback from peak has happened regardless of trend
+            if self.droi_pullback.value == True and (current_profit < pullback_value):
+                if self.droi_pullback_respect_table.value == True:
+                    min_roi = table_roi
+                else:
+                    min_roi = current_profit / 2
+
+        return trade_dur, min_roi
+
+    def min_roi_reached(self, trade: Trade, current_profit: float, current_time: datetime) -> bool:
+        trade_dur = int((current_time.timestamp() - trade.open_date_utc.timestamp()) // 60)
+
+        if self.config['runmode'].value in ('live', 'dry_run', 'backtest'):
+            _, roi = self.min_roi_reached_dynamic(trade, current_profit, current_time, trade_dur)
+        else:
+            roi = self.get_table_roi(trade_dur)
+
+        if roi is None:
+            return False
+        else:
+            return current_profit > roi
+
+    def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
+                        current_profit: float, **kwargs) -> float:
+        
+        return self.stoploss
 
     #############################################################
 
@@ -157,6 +269,12 @@ class NFI5MOHO_WIP(IStrategy):
         "high_offset_t3": 0.999,
         "high_offset_trima": 1.096,
     }
+
+    # Dynamic ROI
+    droi_trend_type = CategoricalParameter(['rmi', 'ssl', 'candle', 'any'], default='any', space='sell', optimize=True)
+    droi_pullback = CategoricalParameter([True, False], default=True, space='sell', optimize=True)
+    droi_pullback_amount = DecimalParameter(0.005, 0.02, default=0.005, space='sell', optimize=True)
+    droi_pullback_respect_table = CategoricalParameter([True, False], default=False, space='sell', optimize=True)
 
     # ROI table - Time-based decay matching avg winner duration
     minimal_roi = {
@@ -242,7 +360,9 @@ class NFI5MOHO_WIP(IStrategy):
     trailing_stop_positive = 0.01
     trailing_stop_positive_offset = 0.03
 
-    use_custom_stoploss = False
+    trailing_stop_positive_offset = 0.03
+
+    use_custom_stoploss = True
 
     # Optimal timeframe for the strategy.
     timeframe = '5m'
@@ -521,22 +641,8 @@ class NFI5MOHO_WIP(IStrategy):
         return int(self.timeframe[:-1])
 
 
-    def custom_sell(self, pair: str, trade: 'Trade', current_time: 'datetime', current_rate: float,
-                    current_profit: float, **kwargs):
-        # Prevent lookahead in backtest
-        if self.dp.runmode.value in ('backtest', 'hyperopt'):
-            return None
-
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-        # Use iloc[-2] to get the PREVIOUS completed candle, preventing lookahead bias
-        # iloc[-1] would read the current (incomplete) candle's final values
-        if len(dataframe) < 2:
-            return None
-        last_candle = dataframe.iloc[-2].squeeze()
-
-        max_profit = ((trade.max_rate - trade.open_rate) / trade.open_rate)
-
         if (last_candle is not None):
+            # Check if timeframe allows exit
             if (current_profit > self.sell_custom_profit_4.value) & (last_candle['rsi'] < self.sell_custom_rsi_4.value):
                 return 'signal_profit_4'
             elif (current_profit > self.sell_custom_profit_3.value) & (last_candle['rsi'] < self.sell_custom_rsi_3.value):
@@ -639,7 +745,23 @@ class NFI5MOHO_WIP(IStrategy):
         dataframe['ema_26'] = ta.EMA(dataframe, timeperiod=26)
         dataframe['ema_50'] = ta.EMA(dataframe, timeperiod=50)
         dataframe['ema_100'] = ta.EMA(dataframe, timeperiod=100)
+        dataframe['ema_100'] = ta.EMA(dataframe, timeperiod=100)
         dataframe['ema_200'] = ta.EMA(dataframe, timeperiod=200)
+
+        dataframe['ema_100'] = ta.EMA(dataframe, timeperiod=100)
+        dataframe['ema_200'] = ta.EMA(dataframe, timeperiod=200)
+
+        # ---------------------------------------------------------------------------------------------------------
+        # Dynamic ROI Indicators
+        # ---------------------------------------------------------------------------------------------------------
+        dataframe['rmi'] = RMI(dataframe, length=24, mom=5)
+        ssldown, sslup = SSLChannels_ATR(dataframe, length=21)
+        dataframe['ssl-dir'] = np.where(sslup > ssldown, 'up', 'down')
+        dataframe['rmi-up'] = np.where(dataframe['rmi'] >= dataframe['rmi'].shift(), 1, 0)
+        dataframe['rmi-up-trend'] = np.where(dataframe['rmi-up'].rolling(5).sum() >= 3, 1, 0)
+        dataframe['candle-up'] = np.where(dataframe['close'] >= dataframe['close'].shift(), 1, 0)
+        dataframe['candle-up-trend'] = np.where(dataframe['candle-up'].rolling(5).sum() >= 3, 1, 0)
+        # ---------------------------------------------------------------------------------------------------------
 
         # SMA
         dataframe['sma_5'] = ta.SMA(dataframe, timeperiod=5)
@@ -656,6 +778,11 @@ class NFI5MOHO_WIP(IStrategy):
 
         # RSI
         dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+
+        # ADX / DMI for Veto
+        dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
+        dataframe['plus_di'] = ta.PLUS_DI(dataframe, timeperiod=14)
+        dataframe['minus_di'] = ta.MINUS_DI(dataframe, timeperiod=14)
 
         # Chopiness
         dataframe['chop']= qtpylib.chopiness(dataframe, 14)
@@ -754,7 +881,7 @@ class NFI5MOHO_WIP(IStrategy):
                 (dataframe['rsi_1h'] < self.buy_rsi_1h_max_1.value) &
                 (dataframe['rsi'] < self.buy_rsi_1.value) &
                 (dataframe['mfi'] < self.buy_mfi_1.value) &
-
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -774,7 +901,7 @@ class NFI5MOHO_WIP(IStrategy):
                 (dataframe['rsi'] < dataframe['rsi_1h'] - self.buy_rsi_1h_diff_2.value) &
                 (dataframe['mfi'] < self.buy_mfi_2.value) &
                 (dataframe['close'] < (dataframe['bb_lowerband'] * self.buy_bb_offset_2.value)) &
-
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -793,8 +920,9 @@ class NFI5MOHO_WIP(IStrategy):
                 dataframe['bbdelta'].gt(dataframe['close'] * self.buy_bb40_bbdelta_close_3.value) &
                 dataframe['closedelta'].gt(dataframe['close'] * self.buy_bb40_closedelta_close_3.value) &
                 dataframe['tail'].lt(dataframe['bbdelta'] * self.buy_bb40_tail_bbdelta_3.value) &
-                dataframe['close'].lt(dataframe['lower'].shift()) &
-                dataframe['close'].le(dataframe['close'].shift()) &
+                (dataframe['close'].lt(dataframe['lower'].shift())) &
+                (dataframe['close'].le(dataframe['close'].shift())) &
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -810,7 +938,8 @@ class NFI5MOHO_WIP(IStrategy):
 
                 (dataframe['close'] < dataframe['ema_50']) &
                 (dataframe['close'] < self.buy_bb20_close_bblowerband_4.value * dataframe['bb_lowerband']) &
-                (dataframe['volume'] < (dataframe['volume_mean_30'].shift(1) * self.buy_bb20_volume_4.value))
+                (dataframe['volume'] < (dataframe['volume_mean_30'].shift(1) * self.buy_bb20_volume_4.value)) &
+                (dataframe['close'] > dataframe['open'])
             )
         )
 
@@ -828,7 +957,7 @@ class NFI5MOHO_WIP(IStrategy):
                 ((dataframe['ema_26'] - dataframe['ema_12']) > (dataframe['open'] * self.buy_ema_open_mult_5.value)) &
                 ((dataframe['ema_26'].shift() - dataframe['ema_12'].shift()) > (dataframe['open'] / 100)) &
                 (dataframe['close'] < (dataframe['bb_lowerband'] * self.buy_bb_offset_5.value)) &
-
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -846,7 +975,7 @@ class NFI5MOHO_WIP(IStrategy):
                 ((dataframe['ema_26'] - dataframe['ema_12']) > (dataframe['open'] * self.buy_ema_open_mult_6.value)) &
                 ((dataframe['ema_26'].shift() - dataframe['ema_12'].shift()) > (dataframe['open'] / 100)) &
                 (dataframe['close'] < (dataframe['bb_lowerband'] * self.buy_bb_offset_6.value)) &
-
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -866,7 +995,8 @@ class NFI5MOHO_WIP(IStrategy):
                 ((dataframe['ema_26'] - dataframe['ema_12']) > (dataframe['open'] * self.buy_ema_open_mult_7.value)) &
                 ((dataframe['ema_26'].shift() - dataframe['ema_12'].shift()) > (dataframe['open'] / 100)) &
                 (dataframe['rsi'] < self.buy_rsi_7.value) &
-
+                (dataframe['close'] < (dataframe['ema_200_1h'] * self.buy_ema_rel_7.value)) &
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -875,16 +1005,17 @@ class NFI5MOHO_WIP(IStrategy):
             (
                 self.buy_condition_8_enable.value &
 
+                (dataframe['ema_100'] > dataframe['ema_200']) &
                 (dataframe['ema_50_1h'] > dataframe['ema_200_1h']) &
 
                 (dataframe['safe_dips_loose']) &
                 (dataframe['safe_pump_24_1h']) &
 
                 (dataframe['rsi'] < self.buy_rsi_8.value) &
-                (dataframe['volume'] > (dataframe['volume'].shift(1) * self.buy_volume_8.value)) &
+                (dataframe['close'] < (dataframe['bb_lowerband'] * 0.999)) &
+                (dataframe['tail'] > (dataframe['open'] * self.buy_tail_diff_8.value / 100)) &
+                (dataframe['volume'] < (dataframe['volume'].rolling(4).mean() * self.buy_volume_8.value)) &
                 (dataframe['close'] > dataframe['open']) &
-                ((dataframe['close'] - dataframe['low']) > ((dataframe['close'] - dataframe['open']) * self.buy_tail_diff_8.value)) &
-
                 (dataframe['volume'] > 0)
             )
         )
@@ -895,17 +1026,19 @@ class NFI5MOHO_WIP(IStrategy):
 
                 (dataframe['ema_50'] > dataframe['ema_200']) &
                 (dataframe['ema_100'] > dataframe['ema_200']) &
+                (dataframe['ema_50_1h'] > dataframe['ema_200_1h']) &
 
                 (dataframe['safe_dips_strict']) &
-                (dataframe['safe_pump_24_loose_1h']) &
+                (dataframe['safe_pump_24_1h']) &
 
                 (dataframe['volume_mean_4'] * self.buy_volume_9.value > dataframe['volume']) &
 
-                (dataframe['close'] < dataframe['ema_20'] * self.buy_ma_offset_9.value) &
+                (dataframe['close'] < dataframe['ema_50'] * self.buy_ma_offset_9.value) &
                 (dataframe['close'] < dataframe['bb_lowerband'] * self.buy_bb_offset_9.value) &
                 (dataframe['rsi_1h'] > self.buy_rsi_1h_min_9.value) &
                 (dataframe['rsi_1h'] < self.buy_rsi_1h_max_9.value) &
                 (dataframe['mfi'] < self.buy_mfi_9.value) &
+                (dataframe['close'] > dataframe['open']) &
                 (dataframe['volume'] > 0)
             )
         )
@@ -1325,24 +1458,28 @@ class NFI5MOHO_WIP(IStrategy):
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
-            # ADX Gate - Regime Filter
+            # Get Analyzed Dataframe
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-            if len(dataframe) >= 2:
-                last_candle = dataframe.iloc[-1]
-                
-                # Check 1h indicators for regime
-                adx_1h = last_candle.get('adx_1h', 0)
-                ema_200_1h = last_candle.get('ema_200_1h', 0)
-                close_1h = last_candle.get('close_1h', last_candle['close'])
-                
-                # If ADX > 30 (strong trend) AND price below EMA200 (downtrend)
-                # Block entry - we don't want to buy dips in a crash
-                if adx_1h > 30 and close_1h < ema_200_1h:
-                    if not is_backtest:
-                        msg = f"⛔ {pair} Entry Rejected by ADX Gate\nADX: {adx_1h:.1f} (>30)\nTrend: Bearish (Price < EMA200)"
-                        self.dp.send_msg(msg)
-                    return False
-            
+            last_candle = dataframe.iloc[-1]
+
+            if self.enable_onchain_filter.value:
+                # Check for high risk signals
+                try:
+                    # We need to access the dataframe row here as well, safely. 
+                    # But confirm_trade_entry assumes 'last_candle' is the current state.
+                    # Since we removed the price action check, this is now just for metadata/network health.
+                    pass
+                except Exception:
+                    pass
+            # Detects strong bearish trends using DMI
+            # If ADX > 25 (Trend) AND DI- > DI+ (Bearish) -> Veto
+            # if last_candle['adx'] > 25.0 and last_candle['minus_di'] > last_candle['plus_di']:
+            #     # Ensure we are not catching a knife in a strong trend
+            #     if not is_backtest:
+            #         msg = f"⛔ {pair} Entry Rejected by ADX Trend Veto\nADX: {last_candle['adx']:.1f} (>25)\nDirection: Bearish (DI- > DI+)"
+            #         self.dp.send_msg(msg)
+            #     return False
+
             # BTC Dominance Veto (live only)
             if market_context.should_veto_altcoin(pair, is_backtest):
                 if not is_backtest:

@@ -144,3 +144,6 @@ project_prompt_generator
 project_prompt.md
 research_request.md
 optimization_research_request.md
+Strategy_Collection
+debug_output.txt
+backtest_results.txt

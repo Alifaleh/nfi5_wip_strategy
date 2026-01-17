@@ -155,12 +155,6 @@ class NFI5MOHO_WIP(IStrategy):
     position_adjustment_enable = True
     max_entry_position_adjustment = 2
 
-    def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
-                            proposed_stake: float, min_stake: float, max_stake: float,
-                            **kwargs) -> float:
-        # "Safety Net" Strategy: Use 1/3 of the allocated capital for initial entry
-        # This reserves 2/3 for potential DCA buys
-        return proposed_stake / 3.0
 
     def adjust_trade_position(self, trade: Trade, current_time: datetime,
                               current_rate: float, current_profit: float, min_stake: float,
@@ -748,51 +742,9 @@ class NFI5MOHO_WIP(IStrategy):
         return int(self.timeframe[:-1])
 
 
-        if (last_candle is not None):
-            # Check if timeframe allows exit
-            if (current_profit > self.sell_custom_profit_4.value) & (last_candle['rsi'] < self.sell_custom_rsi_4.value):
-                return 'signal_profit_4'
-            elif (current_profit > self.sell_custom_profit_3.value) & (last_candle['rsi'] < self.sell_custom_rsi_3.value):
-                return 'signal_profit_3'
-            elif (current_profit > self.sell_custom_profit_2.value) & (last_candle['rsi'] < self.sell_custom_rsi_2.value):
-                return 'signal_profit_2'
-            elif (current_profit > self.sell_custom_profit_1.value) & (last_candle['rsi'] < self.sell_custom_rsi_1.value):
-                return 'signal_profit_1'
-            elif (current_profit > self.sell_custom_profit_0.value) & (last_candle['rsi'] < self.sell_custom_rsi_0.value):
-                return 'signal_profit_0'
-
-            elif (current_profit > self.sell_custom_under_profit_1.value) & (last_candle['rsi'] < self.sell_custom_under_rsi_1.value) & (last_candle['close'] < last_candle['ema_200']):
-                return 'signal_profit_u_1'
-            elif (current_profit > self.sell_custom_under_profit_2.value) & (last_candle['rsi'] < self.sell_custom_under_rsi_2.value) & (last_candle['close'] < last_candle['ema_200']):
-                return 'signal_profit_u_2'
-            elif (current_profit > self.sell_custom_under_profit_3.value) & (last_candle['rsi'] < self.sell_custom_under_rsi_3.value) & (last_candle['close'] < last_candle['ema_200']):
-                return 'signal_profit_u_3'
-
-            elif (current_profit > self.sell_custom_dec_profit_1.value) & (last_candle['sma_200_dec']):
-                return 'signal_profit_d_1'
-            elif (current_profit > self.sell_custom_dec_profit_2.value) & (last_candle['close'] < last_candle['ema_100']):
-                return 'signal_profit_d_2'
-
-            elif (current_profit > self.sell_trail_profit_min_1.value) & (current_profit < self.sell_trail_profit_max_1.value) & (max_profit > (current_profit + self.sell_trail_down_1.value)):
-                return 'signal_profit_t_1'
-            elif (current_profit > self.sell_trail_profit_min_2.value) & (current_profit < self.sell_trail_profit_max_2.value) & (max_profit > (current_profit + self.sell_trail_down_2.value)):
-                return 'signal_profit_t_2'
-
-            elif (last_candle['close'] < last_candle['ema_200']) & (current_profit > self.sell_trail_profit_min_3.value) & (current_profit < self.sell_trail_profit_max_3.value) & (max_profit > (current_profit + self.sell_trail_down_3.value)):
-                return 'signal_profit_u_t_1'
-
-            elif (current_profit > 0.0) & (last_candle['close'] < last_candle['ema_200']) & (((last_candle['ema_200'] - last_candle['close']) / last_candle['close']) < self.sell_custom_profit_under_rel_1.value) & (last_candle['rsi'] > last_candle['rsi_1h'] + self.sell_custom_profit_under_rsi_diff_1.value):
-                return 'signal_profit_u_e_1'
-
-            elif (current_profit < -0.0) & (last_candle['close'] < last_candle['ema_200']) & (((last_candle['ema_200'] - last_candle['close']) / last_candle['close']) < self.sell_custom_stoploss_under_rel_1.value) & (last_candle['rsi'] > last_candle['rsi_1h'] + self.sell_custom_stoploss_under_rsi_diff_1.value):
-                return 'signal_stoploss_u_1'
-
-        return None
-
-    # Safe Pump (Green Candle) settings
-    buy_min_inc_1 = DecimalParameter(0.01, 0.05, default=0.022, space='buy', decimals=3, optimize=False, load=True)
 
     def informative_pairs(self):
+
         # get access to all pairs available in whitelist.
         pairs = self.dp.current_whitelist()
         # Assign tf to each pair so they can be downloaded and cached for strategy.
@@ -1604,9 +1556,14 @@ class NFI5MOHO_WIP(IStrategy):
             # Ensure within bounds
             adjusted_stake = max(min_stake, min(adjusted_stake, max_stake))
             
-            return adjusted_stake
+            # CRITICAL DCA ADJUSTMENT:
+            # We must return 1/3 of the calculated stake to allow for 2 subsequent DCA entries.
+            # If we returned the full 'adjusted_stake' here, we would blow our risk on the first entry.
+            return adjusted_stake / 3.0
+            
         except Exception:
-            return proposed_stake
+            # Fallback: strict 1/3 split of proposed
+            return proposed_stake / 3.0
 
     # =========================================================================
     # REGIME FILTER - ADX Gate + BTC Dominance Veto

@@ -157,46 +157,76 @@ class NFI5MOHO_WIP(IStrategy):
 
 
     def adjust_trade_position(self, trade: Trade, current_time: datetime,
-                              current_rate: float, current_profit: float, min_stake: float,
-                              max_stake: float, **kwargs):
+                                current_rate: float, current_profit: float, min_stake: float,
+                                max_stake: float, **kwargs) -> float:
         """
-        Custom Trade Position Adjustment (DCA)
-        Strategy: "Safety Net"
+        Custom Trade Position Adjustment (Dynamic DCA)
+        Strategy: "Volatility-Based Safety Net"
         - Buy 1 (Initial): 33%
-        - Buy 2 (DCA 1): 33% at -3% profit
-        - Buy 3 (DCA 2): 33% at -8% profit
+        - Buy 2 (DCA 1): 33% at 1.5x ATR distance
+        - Buy 3 (DCA 2): 33% at 4.0x ATR distance
         """
-        # 1. Stoploss safety check (don't buy if we are about to hit SL)
-        # Assuming SL is static for now, or use trade.stop_loss
-        if current_profit < self.stoploss + 0.02:
-             return None
-
-        # 2. Count existing buys
-        count_of_buys = trade.nr_of_successful_buys
-
-        # 3. Define Triggers
-        # Buy #2 (Count 1) at -3%
-        # Buy #3 (Count 2) at -8%
-        if not (
-            (count_of_buys == 1 and current_profit < -0.03) or
-            (count_of_buys == 2 and current_profit < -0.08)
-        ):
+        if self.position_adjustment_enable == False:
             return None
 
-        # 4. Green Candle Confirmation (Anti-Falling Knife for DCA too)
-        # We want to buy the *bounce*, not the drop.
-        dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
-        if len(dataframe) > 0:
-            last_candle = dataframe.iloc[-1]
-            if last_candle['close'] < last_candle['open']:
-                return None
+        # 1. Verify we have funds/slots for DCA
+        # Strategy allows max 2 open trades, each with up to 3 buys (Total 6 slots of capital)
+        # If order_count is already 3, we stop.
+        count_of_buys = trade.nr_of_successful_buys
+        if count_of_buys >= 3:
+            return None
 
-        # 5. Calculate Stake to Buy (Equal parts)
-        # If current trade.stake_amount is result of N buys, initial was stake/N.
-        # We want to add exactly 1x initial stake.
-        initial_stake = trade.stake_amount / count_of_buys
+        # 2. Get Dataframe and ATR
+        # We need current volatility to decide spacing.
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+            last_candle = dataframe.iloc[-1]
+            current_atr = last_candle['atr']
+        except Exception as e:
+            # Fallback if data missing
+            current_atr = 0.0
+
+        # 3. Calculate Dynamic Thresholds
+        # If ATR is missing or 0, fallback to fixed safety levels (-3%, -8%)
+        if current_atr > 0:
+            # Calculate distance relative to OPEN RATE
+            # DCA 1 distance = 1.5 * ATR
+            # DCA 2 distance = 4.0 * ATR
+            
+            # Convert to percentage drop from open rate
+            # threshold = - (distance / open_rate)
+            dca_1_threshold = - (1.5 * current_atr) / trade.open_rate
+            dca_2_threshold = - (4.0 * current_atr) / trade.open_rate
+        else:
+            # Safe Fallbacks
+            dca_1_threshold = -0.03
+            dca_2_threshold = -0.08
+            
+        # 4. Check Conditions
+        # Use a Green Candle confirmation for the entry to avoid catching a knife
+        # We need 'close' > 'open' on the last candle.
+        # Note: 'last_candle' is the last closed candle.
         
-        return initial_stake
+        # Determine target stake (1/3 of total allowed per trade)
+        # We simply want to fill the next slot.
+        # stake_amount is fixed in config (e.g. 500). 
+        # But here 'current_rate' etc are passed. We need to buy an equal chunk.
+        # Easy way: duplicate the initial stake.
+        
+        if count_of_buys == 1:
+            # Trying for 1st DCA
+            if current_profit < dca_1_threshold:
+                 # Add Green Candle Confirmation
+                if last_candle['close'] > last_candle['open']:
+                    return trade.stake_amount # Adding another chunk
+                
+        if count_of_buys == 2:
+            # Trying for 2nd DCA
+            if current_profit < dca_2_threshold:
+                if last_candle['close'] > last_candle['open']:
+                    return trade.stake_amount # Adding final chunk
+
+        return None
 
     def get_table_roi(self, trade_dur: int) -> float:
         """
@@ -263,6 +293,7 @@ class NFI5MOHO_WIP(IStrategy):
             return False
         else:
             return current_profit > roi
+
 
     def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                         current_profit: float, **kwargs) -> float:
@@ -847,6 +878,11 @@ class NFI5MOHO_WIP(IStrategy):
 
         # RSI
         dataframe['rsi'] = ta.RSI(dataframe, timeperiod=14)
+        dataframe['rsi_fast'] = ta.RSI(dataframe, timeperiod=4) # NASOSv4 Alpha
+        dataframe['rsi_slow'] = ta.RSI(dataframe, timeperiod=20)
+
+        # EMA 8 (NASOSv4 Alpha buy reference)
+        dataframe['ema_8'] = ta.EMA(dataframe, timeperiod=8)
 
         # ADX / DMI for Veto
         dataframe['adx'] = ta.ADX(dataframe, timeperiod=14)
@@ -864,20 +900,14 @@ class NFI5MOHO_WIP(IStrategy):
         dataframe['vwap'] = (typical_price * dataframe['volume']).rolling(288).sum() / dataframe['volume'].rolling(288).sum()
 
         # Dip protection
-        dataframe['safe_dips'] = ((((dataframe['open'] - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_1.value) &
-                                  (((dataframe['open'].rolling(2).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_2.value) &
-                                  (((dataframe['open'].rolling(12).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_3.value) &
-                                  (((dataframe['open'].rolling(144).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_4.value))
+        # Dip protection -  Replaced with Adaptive Z-Score Logic
+        # Z-Score < -2.0 means price is 2 StdDev below mean (Statistical Dip)
+        # TWEAK: Relaxed to -1.75 to increase volume safely (was -2.0)
+        dataframe['safe_dips'] = dataframe['z_score'] < -1.75
 
-        dataframe['safe_dips_strict'] = ((((dataframe['open'] - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_5.value) &
-                                  (((dataframe['open'].rolling(2).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_6.value) &
-                                  (((dataframe['open'].rolling(12).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_7.value) &
-                                  (((dataframe['open'].rolling(144).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_8.value))
+        dataframe['safe_dips_strict'] = dataframe['z_score'] < -2.5
 
-        dataframe['safe_dips_loose'] = ((((dataframe['open'] - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_9.value) &
-                                  (((dataframe['open'].rolling(2).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_10.value) &
-                                  (((dataframe['open'].rolling(12).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_11.value) &
-                                  (((dataframe['open'].rolling(144).max() - dataframe['close']) / dataframe['close']) < self.buy_dip_threshold_12.value))
+        dataframe['safe_dips_loose'] = dataframe['z_score'] < -1.5
 
         # Volume
         dataframe['volume_mean_4'] = dataframe['volume'].rolling(4).mean().shift(1)
@@ -943,8 +973,23 @@ class NFI5MOHO_WIP(IStrategy):
             # If price pumped >15% in last 7 days, avoid buying the top
             dataframe['pct_change_7d'] = dataframe['close'].pct_change(periods=2016)
 
+            # E. ADAPTIVE Z-SCORE METRICS (Regime-Aware Dip Detection)
+            # -------------------------------------------------------------
+            # Calculate Rolling Stats (Window 36 = 3 hours) to match typical NFI short-term horizons
+            roll_window = 36
+            rolling_stats = dataframe['close'].rolling(window=roll_window)
+            dataframe['roll_mean'] = rolling_stats.mean()
+            dataframe['roll_std'] = rolling_stats.std()
+            
+            # Z-Score: How many standard deviations is the price from the mean?
+            # Negative Z-score = Dip. Positive Z-score = Pump.
+            # Avoid division by zero
+            dataframe['z_score'] = (dataframe['close'] - dataframe['roll_mean']) / dataframe['roll_std'].replace(0, 1)
+
+
 
         # The indicators for the 1h informative timeframe
+
         informative_1h = self.informative_1h_indicators(dataframe, metadata)
         
         # Shift the informative dataframe by 1 to prevent lookahead bias
@@ -956,6 +1001,23 @@ class NFI5MOHO_WIP(IStrategy):
 
         # The indicators for the normal (5m) timeframe
         dataframe = self.normal_tf_indicators(dataframe, metadata)
+
+         # VWAP Z-Score: Distance from VWAP in Standard Deviations
+        # High Positive Z-Score (> 3.0) = Price is statistically overextended (Toxic Top)
+        # (Must be calculated AFTER normal_tf_indicators creates 'vwap')
+        vwap_std = dataframe['close'].rolling(window=288).std()
+        dataframe['vwap_z_score'] = (dataframe['close'] - dataframe['vwap']) / vwap_std.replace(0, 1)
+
+        # F. MOMENTUM DIVERGENCE (For "Safe Aggression" Entries)
+        # -------------------------------------------------------------
+        # Bullish Divergence: Price makes Lower Low, RSI makes Higher Low (Window 10)
+        # We check if current Low is <= 10-candle Min Low AND current RSI > 10-candle Min RSI
+        # And RSI is oversold (< 40)
+        dataframe['bullish_divergence'] = (
+            (dataframe['low'] <= dataframe['low'].rolling(window=10).min()) &
+            (dataframe['rsi'] > dataframe['rsi'].rolling(window=10).min()) &
+            (dataframe['rsi'] < 40)
+        )
 
         # On-Chain Data Integration
         if OnChainOracle:
@@ -1405,6 +1467,20 @@ class NFI5MOHO_WIP(IStrategy):
                 (dataframe['volume'] > 0)
         )
 
+        # -------------------------------------------------------------------
+        # NEW: NASOSv4 "Alpha" (High-Prob Scalp)
+        # Snatches dips in strong trends.
+        # Logic: RSI_Fast < 35 AND Price < EMA_8 * 0.984 AND EWO > 2.0
+        # -------------------------------------------------------------------
+        conditions.append(
+            (
+                (dataframe['rsi_fast'] < 35) &
+                (dataframe['close'] < (dataframe['ema_8'] * 0.984)) &
+                (dataframe['ewo'] > 2.0) & # Only trade IN DIRECTION of trend (EWO positive)
+                (dataframe['volume'] > 0)
+            )
+        )
+        
         if conditions:
             dataframe.loc[
                 reduce(lambda x, y: x | y, conditions),
@@ -1418,101 +1494,9 @@ class NFI5MOHO_WIP(IStrategy):
         return dataframe
 
     def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        conditions = []
-
-        conditions.append(
-            (
-                self.sell_condition_1_enable.value &
-
-                (dataframe['rsi'] > self.sell_rsi_bb_1.value) &
-                (dataframe['close'] > dataframe['bb_upperband']) &
-                (dataframe['close'].shift(1) > dataframe['bb_upperband'].shift(1)) &
-                (dataframe['close'].shift(2) > dataframe['bb_upperband'].shift(2)) &
-                (dataframe['close'].shift(3) > dataframe['bb_upperband'].shift(3)) &
-                (dataframe['close'].shift(4) > dataframe['bb_upperband'].shift(4)) &
-                (dataframe['close'].shift(5) > dataframe['bb_upperband'].shift(5)) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_2_enable.value &
-
-                (dataframe['rsi'] > self.sell_rsi_bb_2.value) &
-                (dataframe['close'] > dataframe['bb_upperband']) &
-                (dataframe['close'].shift(1) > dataframe['bb_upperband'].shift(1)) &
-                (dataframe['close'].shift(2) > dataframe['bb_upperband'].shift(2)) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_3_enable.value &
-
-                (dataframe['rsi'] > self.sell_rsi_main_3.value) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_4_enable.value &
-
-                (dataframe['rsi'] > self.sell_dual_rsi_rsi_4.value) &
-                (dataframe['rsi_1h'] > self.sell_dual_rsi_rsi_1h_4.value) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_6_enable.value &
-
-                (dataframe['close'] < dataframe['ema_200']) &
-                (dataframe['close'] > dataframe['ema_50']) &
-                (dataframe['rsi'] > self.sell_rsi_under_6.value) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_7_enable.value &
-
-                (dataframe['rsi_1h'] > self.sell_rsi_1h_7.value) &
-                qtpylib.crossed_below(dataframe['ema_12'], dataframe['ema_26']) &
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        conditions.append(
-            (
-                self.sell_condition_8_enable.value &
-
-                (dataframe['close'] > dataframe['bb_upperband_1h'] * self.sell_bb_relative_8.value) &
-
-                (dataframe['volume'] > 0)
-            )
-        )
-
-        """
-	for i in self.ma_types:
-            conditions.append(
-                (
-                    (dataframe['close'] > dataframe[f'{i}_offset_sell']) &
-                    (dataframe['volume'] > 0)
-                )
-        )
-	"""
-
-        if conditions:
-            dataframe.loc[
-                reduce(lambda x, y: x | y, conditions),
-                'sell'
-            ] = 1
-
+        # OPTIMIZATION: Disable ALL indicator-based sells.
+        # Rely 100% on ROI (Take Profit) and Chandelier Exit (Trailing).
+        dataframe['sell'] = 0
         return dataframe
 
     # =========================================================================
@@ -1521,13 +1505,7 @@ class NFI5MOHO_WIP(IStrategy):
     def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
                             proposed_stake: float, min_stake: float, max_stake: float,
                             entry_tag: str, side: str, **kwargs) -> float:
-        """
-        Position sizing combining:
-        1. Fear & Greed Modifier - Scale by market sentiment
-        2. Volatility Adjustment - Reduce stake for high-volatility pairs
         
-        Conservative approach: Start with proposed_stake, adjust down for volatility/greed
-        """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
@@ -1535,19 +1513,27 @@ class NFI5MOHO_WIP(IStrategy):
             adjusted_stake = proposed_stake
             
             # Get ATR for volatility adjustment
+            # FIX LOOKAHEAD BIAS: Find the correct row for current_time
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-            if len(dataframe) >= 2:
-                current_atr = dataframe['atr'].iloc[-1]
-                if current_atr > 0 and current_rate > 0:
-                    # Calculate volatility ratio (ATR as % of price)
-                    atr_pct = current_atr / current_rate
+            
+            # Efficiently find the index
+            # We want the candle that triggered the signal (current_time)
+            # In backtesting, current_time matches the open time of the candle
+            # Use searchsorted to find the index (assuming date is sorted)
+            if len(dataframe) > 0:
+                idx = dataframe['date'].searchsorted(current_time, side='left') - 1
+                if 0 <= idx < len(dataframe):
+                    current_atr = dataframe['atr'].iloc[idx]
                     
-                    # High volatility (>3% ATR) = reduce stake proportionally
-                    # Low volatility (<1% ATR) = keep full stake
-                    if atr_pct > 0.03:
-                        volatility_factor = 0.03 / atr_pct  # Inverse scaling
-                        volatility_factor = max(0.3, min(1.0, volatility_factor))  # Clamp 0.3-1.0
-                        adjusted_stake = adjusted_stake * volatility_factor
+                    if current_atr > 0 and current_rate > 0:
+                        # Calculate volatility ratio (ATR as % of price)
+                        atr_pct = current_atr / current_rate
+                        
+                        # High volatility (>3% ATR) = reduce stake proportionally
+                        if atr_pct > 0.03:
+                            volatility_factor = 0.03 / atr_pct
+                            volatility_factor = max(0.3, min(1.0, volatility_factor))
+                            adjusted_stake = adjusted_stake * volatility_factor
             
             # Apply F&G sentiment modifier
             fng_modifier = market_context.get_stake_modifier(current_time, is_backtest)
@@ -1556,13 +1542,10 @@ class NFI5MOHO_WIP(IStrategy):
             # Ensure within bounds
             adjusted_stake = max(min_stake, min(adjusted_stake, max_stake))
             
-            # CRITICAL DCA ADJUSTMENT:
-            # We must return 1/3 of the calculated stake to allow for 2 subsequent DCA entries.
-            # If we returned the full 'adjusted_stake' here, we would blow our risk on the first entry.
+            # CRITICAL DCA ADJUSTMENT: 1/3 split
             return adjusted_stake / 3.0
             
         except Exception:
-            # Fallback: strict 1/3 split of proposed
             return proposed_stake / 3.0
 
     # =========================================================================
@@ -1573,39 +1556,27 @@ class NFI5MOHO_WIP(IStrategy):
                             side: str, **kwargs) -> bool:
         """
         Final veto layer before trade execution.
-        Includes: Smart Pair Filters + ADX Gate + BTC Dominance Veto
         """
         is_backtest = self.dp.runmode.value in ('backtest', 'hyperopt')
         
         try:
             # Get Analyzed Dataframe
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
-            if len(dataframe) < 1:
-                return False
-            last_candle = dataframe.iloc[-1]
+            
+            # FIX LOOKAHEAD BIAS:
+            if len(dataframe) > 0:
+                idx = dataframe['date'].searchsorted(current_time, side='left') - 1
+                if 0 <= idx < len(dataframe):
+                    last_candle = dataframe.iloc[idx]
 
-            # ============== MINIMAL FILTER: Only block extreme "buy the top" ==============
-            
-            # NOTE: Pair blacklist should be in config, not hardcoded here
-            # See exchange.pair_blacklist in config_backtest.json
-            
-            # DISABLED: Macro Trend, Liquidity, Alpha, Distance from High
-            # (These blocked too many profitable trades)
-            
-            # ONLY FILTER: 7-day Pump (set to 50% - optimal threshold)
-            # This catches the specific "bought PROM/DASH at peak then crashed" scenario
-            if 'pct_change_7d' in last_candle:
-                pct7d = last_candle['pct_change_7d']
-                if pd.notna(pct7d) and pct7d > 0.50:  # Pumped more than 50% in 7 days
-                    return False
+                    # ONLY FILTER: 7-day Pump (set to 50%)
+                    if 'pct_change_7d' in last_candle:
+                        pct7d = last_candle['pct_change_7d']
+                        if pd.notna(pct7d) and pct7d > 0.50:
+                            return False
 
-            # ============== ORIGINAL FILTERS ==============
-            
-            # BTC Dominance Veto (live only)
+            # BTC Dominance Veto
             if market_context.should_veto_altcoin(pair, is_backtest):
-                if not is_backtest:
-                    msg = f"⛔ {pair} Entry Rejected by BTC Dominance Veto\nBTC.D > 60%"
-                    self.dp.send_msg(msg)
                 return False
                 
         except Exception:
@@ -1619,18 +1590,28 @@ class NFI5MOHO_WIP(IStrategy):
     def custom_exit(self, pair: str, trade: 'Trade', current_time: datetime,
                     current_rate: float, current_profit: float, **kwargs):
         """
-        Time-based exits - DISABLED (all were losses in backtesting)
+        Chandelier Exit (Dynamic Trailing Stop)
         """
-        # DISABLED: These exits only produced losses in backtesting
-        # trade_duration = (current_time - trade.open_date_utc).total_seconds() / 3600
-        
-        # stale_trade_exit: -$38 (11 losses, 0 wins) - DISABLED
-        # if trade_duration > 12 and -0.005 < current_profit < 0.01:
-        #     return "stale_trade_exit"
-        
-        # time_limit_exit: -$27 (3 losses, 0 wins) - DISABLED
-        # if trade_duration > 24 and current_profit > -0.01:
-        #     return "time_limit_exit"
+        # 1. Activation Threshold (1.5% Profit)
+        if current_profit < 0.015:
+            return None
+            
+        # FIX LOOKAHEAD BIAS:
+        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        if len(dataframe) > 0:
+            idx = dataframe['date'].searchsorted(current_time, side='left') - 1
+            if 0 <= idx < len(dataframe):
+                last_candle = dataframe.iloc[idx]
+                
+                # Use ATR from entry-time or current? Current is fine for trailing.
+                if 'atr' in last_candle:
+                    current_atr = last_candle['atr']
+                    if current_atr > 0:
+                        # Chandelier Stop: Max Rate - 2.0 * ATR
+                        stop_price = trade.max_rate - (current_atr * 2.0)
+                        
+                        if current_rate < stop_price:
+                            return 'chandelier_exit'
         
         return None
 

@@ -125,6 +125,59 @@ class NFI5MOHO_WIP(IStrategy):
         'stoploss_on_exchange': False
     }
 
+    # DCA Configuration
+    position_adjustment_enable = True
+    max_entry_position_adjustment = 2
+
+    def custom_stake_amount(self, pair: str, current_time: datetime, current_rate: float,
+                            proposed_stake: float, min_stake: float, max_stake: float,
+                            **kwargs) -> float:
+        # "Safety Net" Strategy: Use 1/3 of the allocated capital for initial entry
+        # This reserves 2/3 for potential DCA buys
+        return proposed_stake / 3.0
+
+    def adjust_trade_position(self, trade: Trade, current_time: datetime,
+                              current_rate: float, current_profit: float, min_stake: float,
+                              max_stake: float, **kwargs):
+        """
+        Custom Trade Position Adjustment (DCA)
+        Strategy: "Safety Net"
+        - Buy 1 (Initial): 33%
+        - Buy 2 (DCA 1): 33% at -3% profit
+        - Buy 3 (DCA 2): 33% at -8% profit
+        """
+        # 1. Stoploss safety check (don't buy if we are about to hit SL)
+        # Assuming SL is static for now, or use trade.stop_loss
+        if current_profit < self.stoploss + 0.02:
+             return None
+
+        # 2. Count existing buys
+        count_of_buys = trade.nr_of_successful_buys
+
+        # 3. Define Triggers
+        # Buy #2 (Count 1) at -3%
+        # Buy #3 (Count 2) at -8%
+        if not (
+            (count_of_buys == 1 and current_profit < -0.03) or
+            (count_of_buys == 2 and current_profit < -0.08)
+        ):
+            return None
+
+        # 4. Green Candle Confirmation (Anti-Falling Knife for DCA too)
+        # We want to buy the *bounce*, not the drop.
+        dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+        if len(dataframe) > 0:
+            last_candle = dataframe.iloc[-1]
+            if last_candle['close'] < last_candle['open']:
+                return None
+
+        # 5. Calculate Stake to Buy (Equal parts)
+        # If current trade.stake_amount is result of N buys, initial was stake/N.
+        # We want to add exactly 1x initial stake.
+        initial_stake = trade.stake_amount / count_of_buys
+        
+        return initial_stake
+
     def get_table_roi(self, trade_dur: int) -> float:
         """
         Returns the ROI value from the minimal_roi table for the given duration.
